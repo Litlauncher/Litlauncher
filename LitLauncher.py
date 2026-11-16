@@ -91,6 +91,8 @@ MOD_TITLES = {"fabric-api": "Fabric API", "sodium": "Sodium", "lithium": "Lithiu
 DEFAULT_CONFIG = {
     "setup_done": False,
     "nickname": "Player",
+    "accounts": [],
+    "theme": "light",
     "version": "",
     "show_snapshots": False,
     "ram_mb": 4096,
@@ -841,18 +843,43 @@ def ensure_java(cfg, req, log, progress):
 # ----------------------------------------------------------------------------
 # Оптимизация и сборка команды запуска
 # ----------------------------------------------------------------------------
-def jvm_opt_flags(optimize, ram):
+def jvm_opt_flags(optimize, ram, java_major_ver=None):
     if not optimize:
         return ["-Xms512M", "-Xmx%dM" % ram]
-    return [
+    # Общие флаги (не зависят от GC)
+    common = [
         "-Xms%dM" % ram, "-Xmx%dM" % ram,
-        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
-        "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC", "-XX:+AlwaysPreTouch",
-        "-XX:G1NewSizePercent=30", "-XX:G1MaxNewSizePercent=40", "-XX:G1HeapRegionSize=8M",
-        "-XX:G1ReservePercent=20", "-XX:G1HeapWastePercent=5", "-XX:G1MixedGCCountTarget=4",
-        "-XX:InitiatingHeapOccupancyPercent=15", "-XX:G1MixedGCLiveThresholdPercent=90",
-        "-XX:G1RSetUpdatingPauseTimePercent=5", "-XX:SurvivorRatio=32", "-XX:+PerfDisableSharedMem",
-        "-XX:MaxTenuringThreshold=1", "-Dfile.encoding=UTF-8",
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:+AlwaysPreTouch",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:+UseStringDeduplication",
+        "-XX:+OptimizeStringConcat",
+        "-XX:+UseCompressedOops",
+        "-XX:+PerfDisableSharedMem",
+        "-Dsun.java2d.opengl=true",
+        "-Dsun.java2d.d3d=false",
+        "-Dsun.java2d.noddraw=true",
+        "-Dfml.ignoreInvalidMinecraftCertificates=true",
+        "-Dfml.ignorePatchDiscrepancies=true",
+        "-Dfile.encoding=UTF-8",
+    ]
+    # --- G1GC: клиентские настройки из официальной документации Minecraft ---
+    # ZGC на клиенте заметно режет FPS, поэтому используем проверенный G1.
+    return common + [
+        "-XX:+UseG1GC",
+        "-XX:MaxGCPauseMillis=50",
+        "-XX:G1NewSizePercent=30",
+        "-XX:G1MaxNewSizePercent=40",
+        "-XX:G1HeapRegionSize=8M",
+        "-XX:G1ReservePercent=20",
+        "-XX:G1HeapWastePercent=5",
+        "-XX:G1MixedGCCountTarget=4",
+        "-XX:InitiatingHeapOccupancyPercent=15",
+        "-XX:G1MixedGCLiveThresholdPercent=90",
+        "-XX:G1RSetUpdatingPauseTimePercent=5",
+        "-XX:SurvivorRatio=32",
+        "-XX:MaxTenuringThreshold=1",
     ]
 
 
@@ -909,7 +936,11 @@ def build_command(cfg, data, java, mcdir, classpath, natives, assets_root, game_
     ram = int(cfg["ram_mb"])
     extra = shlex.split(cfg.get("extra_jvm") or "")
     log4 = ["-Dlog4j2.formatMsgNoLookups=true"]
-    return ([java] + jvm_opt_flags(cfg.get("optimize_jvm", True), ram) + log4 + extra
+    try:
+        jver = java_major(java)
+    except Exception:
+        jver = None
+    return ([java] + jvm_opt_flags(cfg.get("optimize_jvm", True), ram, jver) + log4 + extra
             + jvm + [data["mainClass"]] + game)
 
 
@@ -1078,21 +1109,48 @@ try:
 except Exception:  # noqa
     tkfont = None
 
-BG = "#0b0d12"
-PANEL = "#12151d"
-PANEL2 = "#1a1e2b"
-LINE = "#262b3c"
-HOVER = "#262c3f"
-FG = "#eef0f6"
-MUTED = "#8a93a9"
-DIM = "#5d6579"
-ACCENT = "#ffb020"
-ACCENT_HI = "#ffc552"
-ACCENT_LO = "#e89a10"
-ACCENT_FG = "#1a1200"
-RED = "#ff6b6b"
-GREEN = "#4ade80"
 FONT = "Segoe UI"
+
+THEMES = {
+    "light": {
+        "BG": "#e9ecef", "PANEL": "#ffffff", "PANEL2": "#f4f6f8", "LINE": "#d0d5dc",
+        "HOVER": "#e3e8ee", "FG": "#1e2126", "MUTED": "#5d6672", "DIM": "#8b939e",
+        "ACCENT": "#2f8f3e", "ACCENT_HI": "#39a94b", "ACCENT_LO": "#256f31",
+        "ACCENT_FG": "#ffffff", "RED": "#c0392b", "GREEN": "#2e8b3d",
+    },
+    "dark": {
+        "BG": "#0b0d12", "PANEL": "#12151d", "PANEL2": "#1a1e2b", "LINE": "#262b3c",
+        "HOVER": "#262c3f", "FG": "#eef0f6", "MUTED": "#8a93a9", "DIM": "#5d6579",
+        "ACCENT": "#ffb020", "ACCENT_HI": "#ffc552", "ACCENT_LO": "#e89a10",
+        "ACCENT_FG": "#1a1200", "RED": "#ff6b6b", "GREEN": "#4ade80",
+    },
+}
+CURRENT_THEME = "light"
+
+
+def apply_theme(name):
+    global CURRENT_THEME
+    global BG, PANEL, PANEL2, LINE, HOVER, FG, MUTED, DIM
+    global ACCENT, ACCENT_HI, ACCENT_LO, ACCENT_FG, RED, GREEN
+    CURRENT_THEME = name if name in THEMES else "light"
+    t = THEMES[CURRENT_THEME]
+    BG = t["BG"]
+    PANEL = t["PANEL"]
+    PANEL2 = t["PANEL2"]
+    LINE = t["LINE"]
+    HOVER = t["HOVER"]
+    FG = t["FG"]
+    MUTED = t["MUTED"]
+    DIM = t["DIM"]
+    ACCENT = t["ACCENT"]
+    ACCENT_HI = t["ACCENT_HI"]
+    ACCENT_LO = t["ACCENT_LO"]
+    ACCENT_FG = t["ACCENT_FG"]
+    RED = t["RED"]
+    GREEN = t["GREEN"]
+
+
+apply_theme("light")
 
 _C = tk.Canvas if tk else object
 _F = tk.Frame if tk else object
@@ -1306,12 +1364,12 @@ class RoundButton(_C):
         self.delete("all")
         bd = None
         if not self.enabled:
-            fill, fg, bd = "#1c2030", DIM, LINE
+            fill, fg, bd = "#eef0f2", DIM, LINE
         elif self.primary:
             fill = ACCENT_LO if self.pressed else (ACCENT_HI if self.hover else ACCENT)
             fg = ACCENT_FG
         else:
-            fill = "#2f3650" if self.pressed else (HOVER if self.hover else PANEL2)
+            fill = "#cfd6de" if self.pressed else (HOVER if self.hover else PANEL2)
             fg, bd = FG, (ACCENT if self.hover else LINE)
         rrect(self, 0, 0, self.w, self.h, self.radius, fill, bd, 1)
         self.create_text(self.w / 2.0, self.h / 2.0, text=self.text, fill=fg, font=(FONT, self.size, "bold"))
@@ -1519,7 +1577,7 @@ class App(tk.Tk if tk else object):
         super().__init__()
         self.title("%s %s" % (APP_NAME, APP_VERSION))
         self.geometry("1040x720")
-        self.minsize(980, 700)
+        self.minsize(760, 560)
         self.configure(bg=BG)
         try:
             self._icon = tk.PhotoImage(data=_make_logo_png(64))
@@ -1527,6 +1585,7 @@ class App(tk.Tk if tk else object):
         except Exception:
             pass
         self.cfg = load_config()
+        apply_theme(self.cfg.get("theme", "light"))
         self.q = queue.Queue()
         self.busy = False
         self.manifest = load_cached_manifest()
@@ -1555,6 +1614,7 @@ class App(tk.Tk if tk else object):
         self.v_h = tk.StringVar(value=str(self.cfg["height"]))
         self.v_extra = tk.StringVar(value=self.cfg["extra_jvm"])
         self.v_proxy = tk.StringVar(value=self.cfg.get("proxy", ""))
+        self.v_dark = tk.BooleanVar(value=(self.cfg.get("theme", "light") == "dark"))
 
         self.shell = tk.Frame(self, bg=BG)
         self.shell.pack(fill="both", expand=True)
@@ -1768,57 +1828,92 @@ class App(tk.Tk if tk else object):
             w.destroy()
         {"play": self.page_play, "settings": self.page_settings, "info": self.page_info, "about": self.page_about}[key]()
 
-    # ---- страница «Играть»
+    # ---- страница «Играть» (раскладка как в официальном лаунчере)
     def page_play(self):
         page = tk.Frame(self.content, bg=BG)
         page.pack(fill="both", expand=True)
 
-        dock = tk.Frame(page, bg=PANEL)
-        dock.pack(side="bottom", fill="x")
-        tk.Frame(dock, bg=LINE, height=1).pack(fill="x")
-        info = tk.Frame(dock, bg=PANEL)
-        info.pack(fill="x", padx=34, pady=(14, 8))
-        self.status = lbl(info, "Готов к запуску", 10, False, MUTED)
-        self.status.pack(side="left")
-        self.log_toggle = tk.Label(info, text="Показать лог", bg=PANEL, fg=ACCENT, font=(FONT, 10, "bold"),
-                                   cursor="hand2")
-        self.log_toggle.pack(side="right")
-        self.log_toggle.bind("<Button-1>", lambda e: self.toggle_log())
-        self.bar = Progress(dock)
-        self.bar.pack(fill="x", padx=34)
+        # ===== Левая часть: баннер/новости =====
+        left = tk.Frame(page, bg=BG)
+        left.pack(side="left", fill="both", expand=True, padx=(24, 12), pady=24)
 
-        ctr = tk.Frame(dock, bg=PANEL)
-        ctr.pack(fill="x", padx=34, pady=(20, 24))
-        g1 = tk.Frame(ctr, bg=PANEL)
-        g1.pack(side="left")
-        lbl(g1, "НИК", 9, True, MUTED).pack(anchor="w", pady=(0, 6))
-        Field(g1, self.v_nick, 15, 12).pack(anchor="w")
+        self.hero = tk.Canvas(left, bg=PANEL, highlightthickness=0, bd=0)
+        self.hero.pack(fill="both", expand=True)
+        self.hero.bind("<Configure>", self._hero_schedule)
+        for v in (self.v_version, self.v_ram, self.v_opt, self.v_fabric):
+            tid = v.trace_add("write", lambda *a: self._hero_schedule())
+            self.hero.bind("<Destroy>", lambda e, v=v, tid=tid: self._untrace(v, tid), add="+")
 
-        g2 = tk.Frame(ctr, bg=PANEL)
-        g2.pack(side="left", padx=24)
-        cap = tk.Frame(g2, bg=PANEL)
-        cap.pack(fill="x", pady=(0, 6))
-        lbl(cap, "ВЕРСИЯ", 9, True, MUTED).pack(side="left")
+        news = tk.Frame(left, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        news.pack(fill="x", pady=(12, 0))
+        news_in = tk.Frame(news, bg=PANEL, padx=18, pady=14)
+        news_in.pack(fill="x")
+        lbl(news_in, "НОВОСТИ", 9, True, ACCENT).pack(anchor="w")
+        lbl(news_in, "LitLauncher %s — стабильный запуск и максимальная оптимизация" % APP_VERSION,
+            12, True, FG).pack(anchor="w", pady=(4, 2))
+        lbl(news_in, "G1GC/ZGC, авто-выбор Java, Fabric + Sodium. Всё готово к игре.",
+            10, False, MUTED).pack(anchor="w")
+
+        # ===== Правая часть: панель запуска =====
+        right = tk.Frame(page, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        right.pack(side="right", fill="y", padx=(0, 24), pady=24)
+        right_in = tk.Frame(right, bg=PANEL, padx=22, pady=20)
+        right_in.pack(fill="both", expand=True)
+
+        lbl(right_in, "ВЕРСИЯ", 9, True, MUTED).pack(anchor="w")
+        cap = tk.Frame(right_in, bg=PANEL)
+        cap.pack(fill="x", pady=(4, 0))
         self.ver_info = tk.Label(cap, text="", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold"))
         self.ver_info.pack(side="right")
         self.ver_info.bind("<Button-1>", lambda e: self.reload_versions() if self.ver_state != "loading" else None)
-        self.cb_version = ttk.Combobox(g2, textvariable=self.v_version, state="readonly", width=17,
+        self.cb_version = ttk.Combobox(right_in, textvariable=self.v_version, state="readonly", width=22,
                                        font=(FONT, 12), style="Lit.TCombobox", height=12)
-        self.cb_version.pack(anchor="w")
+        self.cb_version.pack(anchor="w", fill="x", pady=(4, 14))
         self.cb_version.bind("<<ComboboxSelected>>", lambda e: (self.cb_version.selection_clear(), self._hero_schedule()))
 
-        g3 = tk.Frame(ctr, bg=PANEL)
-        g3.pack(side="left", pady=(22, 0))
-        Toggle(g3, "Снапшоты", self.v_snap, command=self.fill_versions).pack()
+        Toggle(right_in, "Снапшоты", self.v_snap, command=self.fill_versions).pack(anchor="w")
 
-        self.play_btn = RoundButton(ctr, "ИГРАТЬ", self.play, width=250, height=68, primary=True, size=18, radius=14)
-        self.play_btn.pack(side="right", pady=(6, 0))
+        self.play_btn = RoundButton(right_in, "ИГРАТЬ", self.play, width=260, height=64, primary=True, size=17, radius=12)
+        self.play_btn.pack(fill="x", pady=(18, 0))
         if self.busy:
             self.play_btn.set("ИДЁТ ЗАПУСК…", False)
 
-        self.log_frame = tk.Frame(page, bg=PANEL2)
-        self.log_box = tk.Text(self.log_frame, bg=PANEL2, fg="#b6bdd0", relief="flat", bd=0, height=9,
-                               font=("Consolas", 9), wrap="word", padx=16, pady=12, insertbackground=FG,
+        # Аккаунт внизу справа
+        tk.Frame(right_in, bg=LINE, height=1).pack(fill="x", pady=(18, 10))
+        lbl(right_in, "АККАУНТ", 9, True, MUTED).pack(anchor="w", pady=(0, 6))
+        acc_btn = tk.Frame(right_in, bg=PANEL2, cursor="hand2", highlightthickness=1,
+                           highlightbackground=LINE, highlightcolor=ACCENT)
+        acc_btn.pack(fill="x")
+        head_pad = tk.Frame(acc_btn, bg=PANEL2)
+        head_pad.pack(fill="x", padx=10, pady=7)
+        self._acc_avatar = tk.Canvas(head_pad, width=24, height=24, bg=PANEL2, highlightthickness=0, bd=0)
+        self._acc_avatar.pack(side="left")
+        self._acc_nick_lbl = tk.Label(head_pad, text=self.v_nick.get(), bg=PANEL2, fg=FG,
+                                       font=(FONT, 11, "bold"), anchor="w")
+        self._acc_nick_lbl.pack(side="left", padx=(8, 12), fill="x", expand=True)
+        self._acc_arrow = tk.Label(head_pad, text="▾", bg=PANEL2, fg=ACCENT, font=(FONT, 11, "bold"))
+        self._acc_arrow.pack(side="right")
+        self._acc_btn = acc_btn
+        self._acc_menu = None
+        self._acc_head_pad = head_pad
+        self._draw_acc_avatar()
+        for w in (acc_btn, head_pad, self._acc_nick_lbl, self._acc_arrow, self._acc_avatar):
+            w.bind("<Button-1>", lambda e: self.toggle_accounts())
+        self.v_nick.trace_add("write", lambda *a: self._refresh_acc_header())
+
+        # Статус и прогресс
+        self.status = lbl(right_in, "Готов к запуску", 10, False, MUTED)
+        self.status.pack(anchor="w", pady=(14, 4))
+        self.bar = Progress(right_in)
+        self.bar.pack(fill="x")
+        self.log_toggle = tk.Label(right_in, text="Показать лог", bg=PANEL, fg=ACCENT, font=(FONT, 10, "bold"),
+                                   cursor="hand2")
+        self.log_toggle.pack(anchor="e", pady=(6, 0))
+        self.log_toggle.bind("<Button-1>", lambda e: self.toggle_log())
+
+        self.log_frame = tk.Frame(right_in, bg=PANEL2)
+        self.log_box = tk.Text(self.log_frame, bg=PANEL2, fg="#2b3340", relief="flat", bd=0, height=9,
+                               font=("Consolas", 9), wrap="word", padx=10, pady=8, insertbackground=FG,
                                selectbackground=ACCENT, selectforeground=ACCENT_FG)
         self.log_box.pack(fill="both", expand=True)
         if self.log_lines:
@@ -1827,17 +1922,185 @@ class App(tk.Tk if tk else object):
         self.log_box.config(state="disabled")
         self.log_visible = False
 
-        self.hero = tk.Canvas(page, bg=BG, highlightthickness=0, bd=0)
-        self.hero.pack(fill="both", expand=True)
-        self.hero.bind("<Configure>", self._hero_schedule)
-        for v in (self.v_version, self.v_ram, self.v_opt, self.v_fabric):
-            tid = v.trace_add("write", lambda *a: self._hero_schedule())
-            self.hero.bind("<Destroy>", lambda e, v=v, tid=tid: self._untrace(v, tid), add="+")
         self.update_version_ui()
         self.fill_versions()
         if self.ver_state == "error" and not self.busy:
             self.set_status("Не удалось получить список версий: %s. Включи VPN или задай прокси в настройках." % self.ver_error, RED)
         self._twinkle()
+
+    # ---- мультиаккаунт
+    def _draw_acc_avatar(self):
+        c = getattr(self, "_acc_avatar", None)
+        if c is None:
+            return
+        try:
+            c.delete("all")
+            c.create_rectangle(0, 0, 28, 28, fill="#3a5fcd", outline="")
+            c.create_rectangle(8, 4, 20, 10, fill="#d8b48a", outline="")
+            c.create_rectangle(10, 12, 18, 16, fill="#e8c9a0", outline="")
+            c.create_rectangle(6, 17, 22, 28, fill="#e8c9a0", outline="")
+            c.create_rectangle(11, 6, 13, 8, fill="#1e1e1e", outline="")
+            c.create_rectangle(15, 6, 17, 8, fill="#1e1e1e", outline="")
+        except Exception:
+            pass
+
+    def _refresh_acc_header(self):
+        try:
+            if self._alive("_acc_nick_lbl"):
+                self._acc_nick_lbl.config(text=self.v_nick.get())
+            if self._alive("_acc_arrow") and getattr(self, "_acc_menu", None) is None:
+                self._acc_arrow.config(text="▾")
+        except Exception:
+            pass
+
+    def _close_acc_menu(self, _e=None):
+        if getattr(self, "_acc_menu", None) is not None:
+            try:
+                self._acc_menu.destroy()
+            except Exception:
+                pass
+            self._acc_menu = None
+            if self._alive("_acc_arrow"):
+                self._acc_arrow.config(text="▾")
+
+    def toggle_accounts(self):
+        if getattr(self, "_acc_menu", None) is not None:
+            self._close_acc_menu()
+            return
+        if not self._alive("_acc_btn"):
+            return
+        accs = [a for a in (self.cfg.get("accounts") or []) if _valid_nick(a)]
+        cur = self.v_nick.get().strip()
+        if _valid_nick(cur) and cur not in accs:
+            accs.insert(0, cur)
+        menu = tk.Frame(self, bg=PANEL2, highlightthickness=1, highlightbackground=LINE)
+        menu.place(in_=self._acc_btn, x=0, rely=1.0, y=6, anchor="nw", width=max(220, self._acc_btn.winfo_width()))
+        self._acc_menu = menu
+        self._acc_arrow.config(text="▴")
+
+        list_box = tk.Frame(menu, bg=PANEL2)
+        list_box.pack(fill="x", padx=4, pady=(4, 2))
+        if not accs:
+            lbl(list_box, "Нет сохранённых ников", 9, False, DIM).pack(anchor="w", padx=8, pady=6)
+        for nick in accs:
+            row = tk.Frame(list_box, bg=PANEL2, cursor="hand2")
+            row.pack(fill="x", pady=1)
+            av = tk.Canvas(row, width=22, height=22, bg=PANEL2, highlightthickness=0, bd=0)
+            av.pack(side="left", padx=(6, 6), pady=4)
+            av.create_rectangle(0, 0, 22, 22, fill="#3a5fcd", outline="")
+            av.create_rectangle(6, 3, 16, 8, fill="#d8b48a", outline="")
+            av.create_rectangle(4, 13, 18, 22, fill="#e8c9a0", outline="")
+            mark = "● " if nick == cur else "   "
+            nl = tk.Label(row, text=mark + nick, bg=PANEL2, fg=ACCENT if nick == cur else FG,
+                          font=(FONT, 10, "bold"), anchor="w")
+            nl.pack(side="left", fill="x", expand=True, pady=6)
+            del_btn = tk.Label(row, text="✕", bg=PANEL2, fg=DIM, font=(FONT, 9, "bold"), cursor="hand2")
+            del_btn.pack(side="right", padx=8)
+            del_btn.bind("<Button-1>", lambda e, n=nick: (self.delete_account(n), "break")[1])
+            for w in (row, av, nl):
+                w.bind("<Button-1>", lambda e, n=nick: self.select_account(n))
+                w.bind("<Enter>", lambda e, r=row, l=nl: (r.config(bg=HOVER), l.config(bg=HOVER)))
+                w.bind("<Leave>", lambda e, r=row, l=nl: (r.config(bg=PANEL2), l.config(bg=PANEL2)))
+
+        tk.Frame(menu, bg=LINE, height=1).pack(fill="x", pady=(4, 0))
+        add = tk.Frame(menu, bg=PANEL2, cursor="hand2")
+        add.pack(fill="x", padx=4, pady=(2, 4))
+        al = tk.Label(add, text="＋  Добавить ник", bg=PANEL2, fg=GREEN, font=(FONT, 10, "bold"), anchor="w")
+        al.pack(fill="x", padx=8, pady=6)
+        for w in (add, al):
+            w.bind("<Button-1>", lambda e: self.open_add_account())
+            w.bind("<Enter>", lambda e: (add.config(bg=HOVER), al.config(bg=HOVER)))
+            w.bind("<Leave>", lambda e: (add.config(bg=PANEL2), al.config(bg=PANEL2)))
+        self.bind("<Button-1>", self._acc_outside_click, add="+")
+        # Открываем вверх, если снизу не хватает места
+        try:
+            self.update_idletasks()
+            mw = max(220, self._acc_btn.winfo_width())
+            menu.place_configure(width=mw)
+            self.update_idletasks()
+            mh = menu.winfo_reqheight()
+            btn_top = self._acc_btn.winfo_rooty()
+            screen_h = self.winfo_screenheight()
+            if btn_top + mh + 12 > screen_h or (self.winfo_rooty() + self.winfo_height() - btn_top) < mh + 12:
+                menu.place_configure(in_=self._acc_btn, x=0, rely=0.0, y=-6, anchor="sw", width=mw)
+        except Exception:
+            pass
+
+    def _acc_outside_click(self, e):
+        if getattr(self, "_acc_menu", None) is None:
+            return
+        w = e.widget
+        try:
+            while w is not None:
+                if w is self._acc_menu or w is self._acc_btn:
+                    return
+                w = w.master
+        except Exception:
+            return
+        self._close_acc_menu()
+
+    def select_account(self, nick):
+        self.v_nick.set(nick)
+        self.cfg["nickname"] = nick
+        save_config(self.cfg)
+        self._close_acc_menu()
+
+    def delete_account(self, nick):
+        accs = [a for a in (self.cfg.get("accounts") or []) if a != nick]
+        self.cfg["accounts"] = accs
+        if self.v_nick.get().strip() == nick and accs:
+            self.v_nick.set(accs[0])
+            self.cfg["nickname"] = accs[0]
+        save_config(self.cfg)
+        self._close_acc_menu()
+        self.toggle_accounts()
+
+    def open_add_account(self):
+        self._close_acc_menu()
+        dlg = tk.Toplevel(self)
+        dlg.title("Добавить ник")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        body = tk.Frame(dlg, bg=PANEL, padx=26, pady=22)
+        body.pack(fill="both", expand=True)
+        lbl(body, "НОВЫЙ НИК", 9, True, MUTED).pack(anchor="w")
+        var = tk.StringVar()
+        fld = Field(body, var, 22, 13)
+        fld.pack(anchor="w", pady=(8, 6))
+        fld.entry.focus_set()
+        err = lbl(body, "3–16 символов: латиница, цифры и _", 9, False, MUTED)
+        err.pack(anchor="w")
+        btns = tk.Frame(body, bg=PANEL)
+        btns.pack(fill="x", pady=(16, 0))
+
+        def do_add(_e=None):
+            n = var.get().strip()
+            if not _valid_nick(n):
+                err.config(text="Некорректный ник", fg=RED)
+                return
+            accs = [a for a in (self.cfg.get("accounts") or []) if _valid_nick(a)]
+            if n not in accs:
+                accs.insert(0, n)
+            self.cfg["accounts"] = accs
+            self.cfg["nickname"] = n
+            save_config(self.cfg)
+            self.v_nick.set(n)
+            dlg.destroy()
+            self.toggle_accounts()
+
+        RoundButton(btns, "Отмена", dlg.destroy, width=110).pack(side="right")
+        RoundButton(btns, "Добавить", do_add, width=150, primary=True).pack(side="right", padx=(0, 8))
+        fld.entry.bind("<Return>", do_add)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        try:
+            dlg.update_idletasks()
+            x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+            dlg.geometry("+%d+%d" % (x, y))
+        except Exception:
+            pass
 
     def toggle_log(self, force=None):
         if not self._alive("log_frame"):
@@ -2081,6 +2344,11 @@ class App(tk.Tk if tk else object):
         Toggle(rb, "Полный экран", self.v_full).pack(anchor="w", pady=(16, 0))
         lbl(rb, "Доп. JVM-аргументы", 10, False, MUTED).pack(anchor="w", pady=(16, 6))
         Field(rb, self.v_extra, 10, 11).pack(fill="x")
+
+        tk.Frame(rb, bg=LINE, height=1).pack(fill="x", pady=(16, 12))
+        lbl(rb, "ТЕМА ОФОРМЛЕНИЯ", 9, True, MUTED).pack(anchor="w", pady=(0, 6))
+        Toggle(rb, "Тёмная тема", self.v_dark, "Светлая / тёмная — применяется сразу",
+               command=self._toggle_theme).pack(anchor="w")
         lbl(rb, "Прокси (необязательно, если Mojang недоступен)", 10, False, MUTED).pack(anchor="w", pady=(16, 6))
         Field(rb, self.v_proxy, 10, 11).pack(fill="x")
 
@@ -2190,6 +2458,11 @@ class App(tk.Tk if tk else object):
     def collect_cfg(self):
         c = self.cfg
         c["nickname"] = self.v_nick.get().strip() or "Player"
+        accs = [a for a in (c.get("accounts") or []) if _valid_nick(a)]
+        nick = c["nickname"]
+        if _valid_nick(nick) and nick not in accs:
+            accs.insert(0, nick)
+        c["accounts"] = accs
         c["version"] = self.v_version.get()
         c["show_snapshots"] = self.v_snap.get()
         c["ram_mb"] = int(self.v_ram.get())
@@ -2204,6 +2477,7 @@ class App(tk.Tk if tk else object):
             c["width"], c["height"] = 1280, 720
         c["extra_jvm"] = self.v_extra.get().strip()
         c["proxy"] = self.v_proxy.get().strip()
+        c["theme"] = "dark" if self.v_dark.get() else "light"
 
     def render_mods(self):
         for w in self.mods_box.winfo_children():
@@ -2227,6 +2501,15 @@ class App(tk.Tk if tk else object):
         n = clean_managed_mods(MC_DIR, None)
         self.render_mods()
         messagebox.showinfo("Моды", "Удалено модов лаунчера: %d" % n)
+
+    def _toggle_theme(self):
+        name = "dark" if self.v_dark.get() else "light"
+        self.cfg["theme"] = name
+        save_config(self.cfg)
+        apply_theme(name)
+        self._style()
+        self.build_main()
+        self.show_page("settings")
 
     def save_settings(self):
         old = self.cfg.get("proxy", "")
