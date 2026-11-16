@@ -47,7 +47,7 @@ except Exception:  # tkinter может отсутствовать (только
     tk = None
 
 APP_NAME = "LitLauncher"
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 
 # Репозиторий GitHub с релизами лаунчера, формат "владелец/репозиторий".
 # Репозиторий задан, проверка обновлений включена.
