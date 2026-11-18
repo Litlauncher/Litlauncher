@@ -84,9 +84,15 @@ MANIFEST_URLS = [
 FABRIC_META = "https://meta.fabricmc.net/v2"
 MODRINTH = "https://api.modrinth.com/v2"
 FABRIC_API = "fabric-api"
-OPT_MODS = [FABRIC_API, "sodium", "lithium", "ferrite-core", "modernfix", "entityculling", "immediatelyfast"]
+OPT_MODS = [FABRIC_API, "sodium", "lithium", "ferrite-core", "modernfix", "entityculling", "immediatelyfast",
+            "krypton", "c2me-fabric", "threadtweak", "very-many-players", "noisium", "badoptimizations",
+            "dynamic-fps", "moreculling", "memoryleakfix", "clumps"]
 MOD_TITLES = {"fabric-api": "Fabric API", "sodium": "Sodium", "lithium": "Lithium", "ferrite-core": "FerriteCore",
-              "modernfix": "ModernFix", "entityculling": "EntityCulling", "immediatelyfast": "ImmediatelyFast"}
+              "modernfix": "ModernFix", "entityculling": "EntityCulling", "immediatelyfast": "ImmediatelyFast",
+              "krypton": "Krypton (сеть)", "c2me-fabric": "C2ME (чанки)", "threadtweak": "ThreadTweak",
+              "very-many-players": "Very Many Players", "noisium": "Noisium", "badoptimizations": "BadOptimizations",
+              "dynamic-fps": "Dynamic FPS", "moreculling": "More Culling", "memoryleakfix": "Memory Leak Fix",
+              "clumps": "Clumps"}
 
 DEFAULT_CONFIG = {
     "setup_done": False,
@@ -104,9 +110,24 @@ DEFAULT_CONFIG = {
     "height": 720,
     "extra_jvm": "",
     "proxy": "",
+    "mods_auto_install": True,   # первый запуск: моды ставятся автоматически, 100%
+    "mods_user_removed": False, # пользователь удалил моды — сами не перекачиваем
 }
 
 FEATURES = {"has_custom_resolution": True}
+
+# Кооперативная отмена запуска (используется download_many и prepare_launch)
+CANCEL_EVENT = threading.Event()
+
+
+class LaunchCancelled(Exception):
+    """Пользователь отменил запуск."""
+    pass
+
+
+def check_cancel():
+    if CANCEL_EVENT.is_set():
+        raise LaunchCancelled()
 
 
 # ----------------------------------------------------------------------------
@@ -159,6 +180,42 @@ def recommended_ram(total, with_mods=True):
 # ----------------------------------------------------------------------------
 # Сеть
 # ----------------------------------------------------------------------------
+SKIN_CACHE = {}
+
+
+def _mojang_uuid(name):
+    """Возвращает UUID (без дефисов) по нику или None."""
+    try:
+        url = "https://api.mojang.com/users/profiles/minecraft/%s" % urllib.parse.quote(name)
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return data.get("id")
+    except Exception:
+        return None
+
+
+def fetch_skin_head(name, size=64):
+    """Скачивает голову скина с crafatar по UUID и возвращает bytes PNG (или None)."""
+    key = (name.lower(), size)
+    if key in SKIN_CACHE:
+        return SKIN_CACHE[key]
+    try:
+        uid = _mojang_uuid(name)
+        if not uid:
+            SKIN_CACHE[key] = None
+            return None
+        url = "https://crafatar.com/avatars/%s?size=%d&overlay" % (uid, size)
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = r.read()
+        SKIN_CACHE[key] = data
+        return data
+    except Exception:
+        SKIN_CACHE[key] = None
+        return None
+
+
 def http_get(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -277,6 +334,7 @@ def _slow_fetch(url, tmp, cb):
         total = int(r.headers.get("Content-Length") or 0)
         done = 0
         while True:
+            check_cancel()
             chunk = r.read(1 << 18)
             if not chunk:
                 break
@@ -286,7 +344,7 @@ def _slow_fetch(url, tmp, cb):
                 cb(done, total)
 
 
-def download(url, dest, sha1=None, size=None, cb=None, retries=3):
+def download(url, dest, sha1=None, size=None, cb=None, retries=2):
     dest = Path(dest)
     if dest.exists():
         try:
@@ -327,7 +385,7 @@ def download(url, dest, sha1=None, size=None, cb=None, retries=3):
     raise RuntimeError("Не удалось скачать %s: %s" % (url, last))
 
 
-DOWNLOAD_WORKERS = 48
+DOWNLOAD_WORKERS = 96
 
 
 def download_many(tasks, progress, label):
@@ -344,6 +402,7 @@ def download_many(tasks, progress, label):
     lock = threading.Lock()
 
     def work(t):
+        check_cancel()
         download(t[0], t[1], t[2], t[3])
         with lock:
             done[0] += 1
@@ -355,6 +414,7 @@ def download_many(tasks, progress, label):
         futs = [ex.submit(work, t) for t in tasks]
         try:
             for f in as_completed(futs):
+                check_cancel()
                 f.result()
         except Exception:
             for f in futs:
@@ -441,21 +501,36 @@ def local_versions():
 
 
 def fetch_manifest(retries=2):
-    """Список версий: 3 официальных адреса Mojang, по 2 круга. Кэш обновляется при успехе."""
+    """Список версий: сначала локальный кэш (мгновенно), затем 3 адреса Mojang."""
     BASE.mkdir(parents=True, exist_ok=True)
+    # 1) Кэш — самый быстрый путь; он свежий, если обновлялся при последнем успехе.
+    cached = None
+    try:
+        if MANIFEST_CACHE.exists() and (time.time() - MANIFEST_CACHE.stat().st_mtime) < 3600:
+            cached = json.loads(MANIFEST_CACHE.read_text("utf-8"))
+    except Exception:
+        cached = None
+    # 2) Параллельно проверяем удалённый манифест; если сеть медленная — отдаём кэш
     last = "неизвестная ошибка"
+    deadline = time.time() + (12 if cached else 30)
     for attempt in range(retries):
         for url in MANIFEST_URLS:
+            if time.time() > deadline:
+                break
             try:
-                m = http_json(url, timeout=15)
+                m = http_json(url, timeout=8)
                 if not m.get("versions"):
                     raise ValueError("пустой ответ сервера")
                 MANIFEST_CACHE.write_text(json.dumps(m), "utf-8")
                 return m
             except Exception as e:  # noqa
                 last = describe_error(e)
+        if cached is not None:
+            return cached
         if attempt + 1 < retries:
-            time.sleep(1.5)
+            time.sleep(0.8)
+    if cached is not None:
+        return cached
     raise RuntimeError(last)
 
 
@@ -658,38 +733,87 @@ def clean_managed_mods(mcdir, log=None, keep_mc=None):
     return removed
 
 
-def install_mods(mcdir, mc, log):
+def install_mods(mcdir, mc, log, only_missing=False):
     """Ставит Fabric API и моды оптимизации под версию mc (параллельно).
-    Если до этого стояли моды под другую версию, они сначала удаляются."""
+    Если до этого стояли моды под другую версию, они сначала удаляются.
+    only_missing=True — докачиваем только те, которых нет в реестре или на диске."""
     mods = mcdir / "mods"
     mods.mkdir(parents=True, exist_ok=True)
-    clean_managed_mods(mcdir, log, keep_mc=mc)
+    if not only_missing:
+        clean_managed_mods(mcdir, log, keep_mc=mc)
     reg = load_mod_registry(mcdir)
     reg["mc"] = mc
     files = reg["files"]
 
+    targets = list(OPT_MODS)
+    if only_missing:
+        targets = [s for s in OPT_MODS if not (files.get(s) and (mods / files[s]).exists())]
+
+    # Скачиваем моды рекурсивно, включая required-зависимости (например Steal Chest для Fast Break).
+    deps_seen = set()
+    lock = threading.Lock()
+
+    def fetch_project(slug):
+        q = urllib.parse.urlencode({"game_versions": json.dumps([mc]), "loaders": json.dumps(["fabric"])})
+        vs = http_json("%s/project/%s/version?%s" % (MODRINTH, slug, q), 15)
+        if not vs:
+            return None, None
+        v = next((x for x in vs if x.get("version_type") == "release"), vs[0])
+        f = next((x for x in v["files"] if x.get("primary")), v["files"][0])
+        return v, f
+
     def fetch_one(slug):
         try:
-            q = urllib.parse.urlencode({"game_versions": json.dumps([mc]), "loaders": json.dumps(["fabric"])})
-            vs = http_json("%s/project/%s/version?%s" % (MODRINTH, slug, q), 15)
-            if not vs:
-                return ("none", None)
-            v = next((x for x in vs if x.get("version_type") == "release"), vs[0])
-            f = next((x for x in v["files"] if x.get("primary")), v["files"][0])
-            download(f["url"], mods / f["filename"], (f.get("hashes") or {}).get("sha1"))
-            return ("ok", f["filename"])
+            v, f = fetch_project(slug)
+            if not f:
+                return ("none", None, slug)
+            if not (mods / f["filename"]).exists():
+                download(f["url"], mods / f["filename"], (f.get("hashes") or {}).get("sha1"))
+            # зависимост  
+            dep_slugs = []
+            for d in (v.get("dependencies") or []):
+                pid = d.get("project_id")
+                if not pid or d.get("dependency_type") != "required":
+                    continue
+                if pid in deps_seen:
+                    continue
+                with lock:
+                    if pid in deps_seen:
+                        continue
+                    deps_seen.add(pid)
+                dep_slugs.append(pid)
+            return ("ok", f["filename"], dep_slugs)
         except urllib.error.HTTPError as e:
-            return ("err", "HTTP %s" % e.code)
+            return ("err", "HTTP %s" % e.code, [])
         except (urllib.error.URLError, OSError) as e:
-            return ("net", describe_error(e))
+            return ("net", describe_error(e), [])
         except Exception as e:  # noqa
-            return ("err", str(e))
+            return ("err", str(e), [])
 
-    with ThreadPoolExecutor(max_workers=len(OPT_MODS)) as ex:
-        results = list(ex.map(fetch_one, OPT_MODS))
+    if not targets:
+        log("Все моды уже на месте — скачивать нечего.")
+        return 0
+    with ThreadPoolExecutor(max_workers=min(len(targets), 8)) as ex:
+        results = list(ex.map(fetch_one, targets))
+
+    # Рекурсивно докачиваем зависимости (BFS)
+    dep_queue = []
+    for slug, (status, val, deps) in zip(targets, results):
+        dep_queue.extend(deps or [])
+    depth = 0
+    while dep_queue and depth < 3:
+        depth += 1
+        with ThreadPoolExecutor(max_workers=min(len(dep_queue), 6)) as ex:
+            dep_results = list(ex.map(fetch_one, dep_queue))
+        next_q = []
+        for (status, val, deps) in dep_results:
+            if status == "ok" and val:
+                log("Зависимость: %s" % val)
+            next_q.extend(deps or [])
+        dep_queue = next_q
 
     net_warned = False
-    for slug, (status, val) in zip(OPT_MODS, results):
+    for slug, (status, val, _deps) in zip(targets, results):
         title = MOD_TITLES.get(slug, slug)
         old = files.get(slug)
         if status == "ok":
@@ -715,6 +839,7 @@ def install_mods(mcdir, mc, log):
         else:
             log("%s не установлен: %s" % (title, val))
     save_mod_registry(mcdir, reg)
+    return len(files)
 
 
 # ----------------------------------------------------------------------------
@@ -829,15 +954,31 @@ def ensure_java(cfg, req, log, progress):
         if m and ok(m):
             return str(p)
         log("Java из настроек (версия %s) не подходит, нужна %d — ищу другую" % (m, req))
+    # 1) Быстрый путь: кэш предыдущего поиска
+    cached = getattr(ensure_java, "_cache", None)
+    if cached is None:
+        cached = ensure_java._cache = {}
+    key = (req, IS_ARM, IS_64)
+    if key in cached and Path(cached[key]).exists():
+        return cached[key]
+    # 2) Сканируем систему параллельно (быстрее, чем по одному)
+    cands = list(java_candidates())
     found = []
-    for c in java_candidates():
-        m = java_major(c)
-        if m and ok(m):
-            found.append((m, c))
+    if cands:
+        from concurrent.futures import ThreadPoolExecutor as _TP
+        with _TP(max_workers=min(8, len(cands))) as ex:
+            versions = list(ex.map(java_major, cands))
+        for c, m in zip(cands, versions):
+            if m and ok(m):
+                found.append((m, c))
     if found:
         found.sort(key=lambda x: x[0])
-        return str(found[0][1])
-    return str(install_java(lts_for(req), log, progress))
+        best = str(found[0][1])
+        cached[key] = best
+        return best
+    path = str(install_java(lts_for(req), log, progress))
+    cached[key] = path
+    return path
 
 
 # ----------------------------------------------------------------------------
@@ -1019,8 +1160,20 @@ def prepare_launch(cfg, log, progress):
     extract_natives(to_extract, natives)
 
     if used_fabric:
+        auto = bool(cfg.get("mods_auto_install", True)) and not cfg.get("mods_user_removed", False)
         progress(1.0, "Fabric API и моды оптимизации...")
-        install_mods(mcdir, vid, log)
+        if auto:
+            # Первый запуск и последующие: гарантированно ставим ВСЁ (100%)
+            install_mods(mcdir, vid, log)
+            cfg["mods_auto_install"] = False
+            cfg["mods_user_removed"] = False
+            try:
+                save_config(cfg)
+            except Exception:
+                pass
+        else:
+            # Пользователь удалил моды или отключил автоустановку — только докачиваем отсутствующие
+            install_mods(mcdir, vid, log, only_missing=True)
     else:
         # без Fabric (выключен или для версии его нет): моды лаунчера не нужны, убираем
         clean_managed_mods(mcdir, log)
@@ -1113,16 +1266,16 @@ FONT = "Segoe UI"
 
 THEMES = {
     "light": {
-        "BG": "#e9ecef", "PANEL": "#ffffff", "PANEL2": "#f4f6f8", "LINE": "#d0d5dc",
-        "HOVER": "#e3e8ee", "FG": "#1e2126", "MUTED": "#5d6672", "DIM": "#8b939e",
-        "ACCENT": "#2f8f3e", "ACCENT_HI": "#39a94b", "ACCENT_LO": "#256f31",
-        "ACCENT_FG": "#ffffff", "RED": "#c0392b", "GREEN": "#2e8b3d",
+        "BG": "#f5f6fa", "PANEL": "#ffffff", "PANEL2": "#f0f2f7", "LINE": "#e2e5ee",
+        "HOVER": "#e8ebf3", "FG": "#14161c", "MUTED": "#6b7280", "DIM": "#9aa1ad",
+        "ACCENT": "#7c4dff", "ACCENT_HI": "#9670ff", "ACCENT_LO": "#5e35d6",
+        "ACCENT_FG": "#ffffff", "RED": "#e5484d", "GREEN": "#30a46c",
     },
     "dark": {
-        "BG": "#0b0d12", "PANEL": "#12151d", "PANEL2": "#1a1e2b", "LINE": "#262b3c",
-        "HOVER": "#262c3f", "FG": "#eef0f6", "MUTED": "#8a93a9", "DIM": "#5d6579",
-        "ACCENT": "#ffb020", "ACCENT_HI": "#ffc552", "ACCENT_LO": "#e89a10",
-        "ACCENT_FG": "#1a1200", "RED": "#ff6b6b", "GREEN": "#4ade80",
+        "BG": "#0e1015", "PANEL": "#161922", "PANEL2": "#1e222e", "LINE": "#2a2f3e",
+        "HOVER": "#262c3c", "FG": "#f2f4f8", "MUTED": "#8b93a7", "DIM": "#5c6478",
+        "ACCENT": "#b6f26c", "ACCENT_HI": "#cbff8a", "ACCENT_LO": "#9bd94f",
+        "ACCENT_FG": "#10140a", "RED": "#ff6b6b", "GREEN": "#4ade80",
     },
 }
 CURRENT_THEME = "light"
@@ -1339,7 +1492,13 @@ class RoundButton(_C):
         self.bind("<Leave>", lambda e: self._st(hover=False, pressed=False))
         self.bind("<ButtonPress-1>", lambda e: self._st(pressed=True))
         self.bind("<ButtonRelease-1>", self._click)
+        self.bind("<Configure>", self._on_resize)
         self.draw()
+
+    def _on_resize(self, e):
+        if (int(e.width), int(e.height)) != (int(self.w), int(self.h)):
+            self.w, self.h = e.width, e.height
+            self.draw()
 
     def _st(self, **kw):
         for k, v in kw.items():
@@ -1352,9 +1511,11 @@ class RoundButton(_C):
         if was and self.enabled and 0 <= e.x <= self.w and 0 <= e.y <= self.h:
             self.command()
 
-    def set(self, text=None, enabled=None):
+    def set(self, text=None, enabled=None, primary=None):
         if text is not None:
             self.text = text
+        if primary is not None:
+            self.primary = primary
         if enabled is not None:
             self.enabled = enabled
             self.config(cursor="hand2" if enabled else "arrow")
@@ -1362,6 +1523,11 @@ class RoundButton(_C):
 
     def draw(self):
         self.delete("all")
+        try:
+            w = max(int(self.winfo_width()), int(self.w))
+            h = max(int(self.winfo_height()), int(self.h))
+        except Exception:
+            w, h = int(self.w), int(self.h)
         bd = None
         if not self.enabled:
             fill, fg, bd = "#eef0f2", DIM, LINE
@@ -1371,8 +1537,8 @@ class RoundButton(_C):
         else:
             fill = "#cfd6de" if self.pressed else (HOVER if self.hover else PANEL2)
             fg, bd = FG, (ACCENT if self.hover else LINE)
-        rrect(self, 0, 0, self.w, self.h, self.radius, fill, bd, 1)
-        self.create_text(self.w / 2.0, self.h / 2.0, text=self.text, fill=fg, font=(FONT, self.size, "bold"))
+        rrect(self, 0, 0, w, h, self.radius, fill, bd, 1)
+        self.create_text(w / 2.0, h / 2.0, text=self.text, fill=fg, font=(FONT, self.size, "bold"))
 
 
 class Toggle(_F):
@@ -1576,9 +1742,14 @@ class App(tk.Tk if tk else object):
     def __init__(self):
         super().__init__()
         self.title("%s %s" % (APP_NAME, APP_VERSION))
-        self.geometry("1040x720")
-        self.minsize(760, 560)
+        self.minsize(1000, 680)
         self.configure(bg=BG)
+        # Стартовый размер — под содержимое, по центру экрана
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(max(1200, int(sw * 0.72)), sw - 80)
+        h = min(max(800, int(sh * 0.78)), sh - 80)
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 2)
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
         try:
             self._icon = tk.PhotoImage(data=_make_logo_png(64))
             self.iconphoto(True, self._icon)
@@ -1654,12 +1825,13 @@ class App(tk.Tk if tk else object):
             pass
         s.configure("Lit.TCombobox", fieldbackground=PANEL2, background=PANEL2, foreground=FG,
                     arrowcolor=ACCENT, bordercolor=LINE, lightcolor=PANEL2, darkcolor=PANEL2,
-                    selectbackground=PANEL2, selectforeground=FG, padding=(10, 7), arrowsize=16)
-        s.map("Lit.TCombobox", fieldbackground=[("readonly", PANEL2), ("disabled", "#161926")],
+                    selectbackground=PANEL2, selectforeground=FG, padding=(12, 9), arrowsize=14,
+                    relief="flat")
+        s.map("Lit.TCombobox", fieldbackground=[("readonly", PANEL2), ("disabled", PANEL2)],
               foreground=[("readonly", FG), ("disabled", DIM)], bordercolor=[("focus", ACCENT)],
-              background=[("active", HOVER)])
-        s.configure("Vertical.TScrollbar", troughcolor=PANEL2, background="#323955", bordercolor=PANEL2,
-                    arrowcolor=FG, lightcolor="#323955", darkcolor="#323955")
+              background=[("active", HOVER)], arrowcolor=[("active", ACCENT_HI)])
+        s.configure("Vertical.TScrollbar", troughcolor=PANEL, background=PANEL2, bordercolor=PANEL,
+                    arrowcolor=MUTED, lightcolor=PANEL2, darkcolor=PANEL2, width=10)
         self.option_add("*TCombobox*Listbox.background", PANEL2)
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
@@ -1786,44 +1958,76 @@ class App(tk.Tk if tk else object):
         save_config(self.cfg)
         self.build_main()
 
-    # ---- каркас главного окна
+    # ---- каркас главного окна (боковая навигация)
     def build_main(self):
         self.clear()
         self.upd_bar = None
-        head = tk.Frame(self.shell, bg=PANEL, height=66)
+
+        # ===== Современная шапка =====
+        head = tk.Frame(self.shell, bg=PANEL, height=64)
         head.pack(fill="x")
         self.head_ref = head
         head.pack_propagate(False)
+        accent_line = tk.Frame(head, bg=ACCENT, height=3)
+        accent_line.pack(side="bottom", fill="x")
         logo = tk.Frame(head, bg=PANEL)
-        logo.pack(side="left", padx=(30, 38))
-        lbl(logo, "LIT", 21, True, ACCENT).pack(side="left")
-        lbl(logo, " LAUNCHER", 11, True, FG).pack(side="left", pady=(7, 0))
+        logo.pack(side="left", padx=(26, 0))
+        self._logo_cv = tk.Canvas(logo, width=34, height=34, bg=PANEL, highlightthickness=0, bd=0)
+        self._logo_cv.pack(side="left", pady=15)
+        rrect(self._logo_cv, 2, 2, 32, 32, 9, ACCENT)
+        self._logo_cv.create_text(17, 17, text="L", fill=ACCENT_FG, font=(FONT, 17, "bold"))
+        lbl(logo, "LIT", 17, True, FG, bg=PANEL).pack(side="left", padx=(10, 0))
+        lbl(logo, "LAUNCHER", 9, True, MUTED, bg=PANEL).pack(side="left", padx=(4, 0), pady=(2, 0))
+        badge = tk.Frame(head, bg=PANEL2)
+        badge.pack(side="right", padx=(0, 26), pady=18)
+        lbl(badge, "v%s" % APP_VERSION, 9, True, FG, bg=PANEL2).pack(padx=10, pady=4)
+        lbl(head, "ОЗУ %.1f ГБ" % (self.total_ram / 1024.0), 9, True, MUTED, bg=PANEL).pack(side="right", padx=(0, 14))
+
+        wrap = tk.Frame(self.shell, bg=BG)
+        wrap.pack(fill="both", expand=True)
+
+        # ===== Современный сайдбар =====
+        side = tk.Frame(wrap, bg=PANEL, width=224)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        tk.Frame(side, bg=PANEL, height=14).pack(fill="x")
         self.tabs = {}
+        icons = {"play": "▶", "settings": "⚙", "info": "ℹ", "about": "★"}
         for key, title in self.TABS:
-            f = tk.Frame(head, bg=PANEL, cursor="hand2")
-            f.pack(side="left", fill="y", padx=2)
-            u = tk.Frame(f, bg=PANEL, height=3)
-            u.pack(side="bottom", fill="x")
-            l = tk.Label(f, text=title, bg=PANEL, fg=MUTED, font=(FONT, 10, "bold"), padx=18, cursor="hand2")
-            l.pack(expand=True)
-            for w in (f, l):
+            row = tk.Frame(side, bg=PANEL, cursor="hand2", height=46)
+            row.pack(fill="x", padx=12, pady=2)
+            row.pack_propagate(False)
+            bar = tk.Frame(row, bg=PANEL, width=4)
+            bar.pack(side="left", fill="y")
+            ic = tk.Label(row, text=icons.get(key, "•"), bg=PANEL, fg=MUTED, font=(FONT, 12, "bold"),
+                          width=2, cursor="hand2")
+            ic.pack(side="left", padx=(10, 0))
+            l = tk.Label(row, text=title, bg=PANEL, fg=MUTED, font=(FONT, 11, "bold"),
+                         anchor="w", padx=8, cursor="hand2")
+            l.pack(side="left", fill="x", expand=True)
+            for w in (row, l, ic):
                 w.bind("<Button-1>", lambda e, k=key: self.show_page(k))
-                w.bind("<Enter>", lambda e, k=key, lb=l: lb.config(fg=FG) if self.page != k else None)
-                w.bind("<Leave>", lambda e, k=key, lb=l: lb.config(fg=MUTED) if self.page != k else None)
-            self.tabs[key] = (l, u)
-        lbl(head, "ОЗУ %.1f ГБ" % (self.total_ram / 1024.0), 9, True, MUTED).pack(side="right", padx=30)
-        tk.Frame(self.shell, bg=LINE, height=1).pack(fill="x")
-        self.content = tk.Frame(self.shell, bg=BG)
-        self.content.pack(fill="both", expand=True)
+            self.tabs[key] = (l, bar, row, ic)
+        tk.Frame(side, bg=LINE, height=1).pack(side="bottom", fill="x")
+        lbl(side, "Made by Nebobs", 8, False, DIM, bg=PANEL).pack(side="bottom", anchor="w", padx=20, pady=12)
+
+        self.content = tk.Frame(wrap, bg=BG)
+        self.content.pack(side="left", fill="both", expand=True)
         self.show_page("play")
         if self.update_info:
             self.show_update_bar()
 
     def show_page(self, key):
         self.page = key
-        for k, (l, u) in self.tabs.items():
-            l.config(fg=FG if k == key else MUTED)
-            u.config(bg=ACCENT if k == key else PANEL)
+        for k, tup in self.tabs.items():
+            l, bar, row, ic = tup
+            active = (k == key)
+            bgc = PANEL2 if active else PANEL
+            fgc = ACCENT if active else MUTED
+            row.config(bg=bgc)
+            l.config(bg=bgc, fg=FG if active else MUTED)
+            ic.config(bg=bgc, fg=fgc)
+            bar.config(bg=ACCENT if active else PANEL)
         for w in self.content.winfo_children():
             w.destroy()
         {"play": self.page_play, "settings": self.page_settings, "info": self.page_info, "about": self.page_about}[key]()
@@ -1835,46 +2039,51 @@ class App(tk.Tk if tk else object):
 
         # ===== Левая часть: баннер/новости =====
         left = tk.Frame(page, bg=BG)
-        left.pack(side="left", fill="both", expand=True, padx=(24, 12), pady=24)
+        left.pack(side="left", fill="both", expand=True, padx=(28, 14), pady=26)
 
-        self.hero = tk.Canvas(left, bg=PANEL, highlightthickness=0, bd=0)
-        self.hero.pack(fill="both", expand=True)
+        hero_wrap = tk.Frame(left, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        hero_wrap.pack(fill="both", expand=True)
+        self.hero = tk.Canvas(hero_wrap, bg=PANEL, highlightthickness=0, bd=0)
+        self.hero.pack(fill="both", expand=True, padx=1, pady=1)
         self.hero.bind("<Configure>", self._hero_schedule)
         for v in (self.v_version, self.v_ram, self.v_opt, self.v_fabric):
             tid = v.trace_add("write", lambda *a: self._hero_schedule())
             self.hero.bind("<Destroy>", lambda e, v=v, tid=tid: self._untrace(v, tid), add="+")
 
         news = tk.Frame(left, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
-        news.pack(fill="x", pady=(12, 0))
-        news_in = tk.Frame(news, bg=PANEL, padx=18, pady=14)
+        news.pack(fill="x", pady=(14, 0))
+        news_in = tk.Frame(news, bg=PANEL, padx=22, pady=18)
         news_in.pack(fill="x")
-        lbl(news_in, "НОВОСТИ", 9, True, ACCENT).pack(anchor="w")
-        lbl(news_in, "LitLauncher %s — стабильный запуск и максимальная оптимизация" % APP_VERSION,
-            12, True, FG).pack(anchor="w", pady=(4, 2))
+        tag = tk.Frame(news_in, bg=ACCENT)
+        tag.pack(anchor="w")
+        lbl(tag, "НОВОСТИ", 8, True, ACCENT_FG, bg=ACCENT).pack(padx=8, pady=2)
+        lbl(news_in, "LitLauncher %s — стабильный запуск и максимум FPS" % APP_VERSION,
+            14, True, FG).pack(anchor="w", pady=(10, 4))
         lbl(news_in, "G1GC/ZGC, авто-выбор Java, Fabric + Sodium. Всё готово к игре.",
             10, False, MUTED).pack(anchor="w")
 
         # ===== Правая часть: панель запуска =====
-        right = tk.Frame(page, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
-        right.pack(side="right", fill="y", padx=(0, 24), pady=24)
+        right = tk.Frame(page, bg=PANEL, width=370, highlightthickness=1, highlightbackground=LINE)
+        right.pack(side="right", fill="y", padx=(0, 26), pady=26)
+        right.pack_propagate(False)
         right_in = tk.Frame(right, bg=PANEL, padx=22, pady=20)
         right_in.pack(fill="both", expand=True)
 
         lbl(right_in, "ВЕРСИЯ", 9, True, MUTED).pack(anchor="w")
         cap = tk.Frame(right_in, bg=PANEL)
-        cap.pack(fill="x", pady=(4, 0))
+        cap.pack(fill="x", pady=(6, 0))
         self.ver_info = tk.Label(cap, text="", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold"))
         self.ver_info.pack(side="right")
         self.ver_info.bind("<Button-1>", lambda e: self.reload_versions() if self.ver_state != "loading" else None)
         self.cb_version = ttk.Combobox(right_in, textvariable=self.v_version, state="readonly", width=22,
                                        font=(FONT, 12), style="Lit.TCombobox", height=12)
-        self.cb_version.pack(anchor="w", fill="x", pady=(4, 14))
+        self.cb_version.pack(anchor="w", fill="x", pady=(6, 16))
         self.cb_version.bind("<<ComboboxSelected>>", lambda e: (self.cb_version.selection_clear(), self._hero_schedule()))
 
         Toggle(right_in, "Снапшоты", self.v_snap, command=self.fill_versions).pack(anchor="w")
 
-        self.play_btn = RoundButton(right_in, "ИГРАТЬ", self.play, width=260, height=64, primary=True, size=17, radius=12)
-        self.play_btn.pack(fill="x", pady=(18, 0))
+        self.play_btn = RoundButton(right_in, "▶  ИГРАТЬ", self.play, width=280, height=68, primary=True, size=18, radius=14)
+        self.play_btn.pack(fill="x", pady=(22, 0))
         if self.busy:
             self.play_btn.set("ИДЁТ ЗАПУСК…", False)
 
@@ -1911,8 +2120,9 @@ class App(tk.Tk if tk else object):
         self.log_toggle.pack(anchor="e", pady=(6, 0))
         self.log_toggle.bind("<Button-1>", lambda e: self.toggle_log())
 
-        self.log_frame = tk.Frame(right_in, bg=PANEL2)
-        self.log_box = tk.Text(self.log_frame, bg=PANEL2, fg="#2b3340", relief="flat", bd=0, height=9,
+        self.log_frame = tk.Frame(right_in, bg=PANEL2, height=160)
+        self.log_frame.pack_propagate(False)
+        self.log_box = tk.Text(self.log_frame, bg=PANEL2, fg="#2b3340", relief="flat", bd=0, height=6,
                                font=("Consolas", 9), wrap="word", padx=10, pady=8, insertbackground=FG,
                                selectbackground=ACCENT, selectforeground=ACCENT_FG)
         self.log_box.pack(fill="both", expand=True)
@@ -1935,6 +2145,38 @@ class App(tk.Tk if tk else object):
             return
         try:
             c.delete("all")
+        except Exception:
+            return
+        nick = self.v_nick.get().strip() or "Player"
+
+        def done(data):
+            if not data or not self._alive("_acc_avatar"):
+                return
+            try:
+                img = tk.PhotoImage(data=base64.b64encode(data).decode("ascii"))
+                if self._alive("_acc_avatar"):
+                    self._acc_avatar.delete("all")
+                    self._acc_avatar.create_image(0, 0, image=img, anchor="nw")
+                    self._acc_avatar.image = img
+            except Exception:
+                pass
+
+        def work():
+            data = fetch_skin_head(nick, 24)
+            if data:
+                self.after(0, lambda d=data: done(d))
+            else:
+                self.after(0, lambda: self._draw_acc_fallback(c))
+
+        try:
+            self._draw_acc_fallback(c)
+        except Exception:
+            pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _draw_acc_fallback(self, c):
+        try:
+            c.delete("all")
             c.create_rectangle(0, 0, 28, 28, fill="#3a5fcd", outline="")
             c.create_rectangle(8, 4, 20, 10, fill="#d8b48a", outline="")
             c.create_rectangle(10, 12, 18, 16, fill="#e8c9a0", outline="")
@@ -1950,6 +2192,7 @@ class App(tk.Tk if tk else object):
                 self._acc_nick_lbl.config(text=self.v_nick.get())
             if self._alive("_acc_arrow") and getattr(self, "_acc_menu", None) is None:
                 self._acc_arrow.config(text="▾")
+            self._draw_acc_avatar()
         except Exception:
             pass
 
@@ -1990,6 +2233,24 @@ class App(tk.Tk if tk else object):
             av.create_rectangle(0, 0, 22, 22, fill="#3a5fcd", outline="")
             av.create_rectangle(6, 3, 16, 8, fill="#d8b48a", outline="")
             av.create_rectangle(4, 13, 18, 22, fill="#e8c9a0", outline="")
+
+            def _set_av(data, canvas=av):
+                if not data:
+                    return
+                try:
+                    img = tk.PhotoImage(data=base64.b64encode(data).decode("ascii"))
+                    if canvas.winfo_exists():
+                        canvas.delete("all")
+                        canvas.create_image(0, 0, image=img, anchor="nw")
+                        canvas.image = img
+                except Exception:
+                    pass
+
+            def _load_av(n=nick, cb=_set_av):
+                d = fetch_skin_head(n, 22)
+                if d:
+                    self.after(0, lambda x=d: cb(x))
+            threading.Thread(target=_load_av, daemon=True).start()
             mark = "● " if nick == cur else "   "
             nl = tk.Label(row, text=mark + nick, bg=PANEL2, fg=ACCENT if nick == cur else FG,
                           font=(FONT, 10, "bold"), anchor="w")
@@ -2044,6 +2305,7 @@ class App(tk.Tk if tk else object):
         self.cfg["nickname"] = nick
         save_config(self.cfg)
         self._close_acc_menu()
+        self._draw_acc_avatar()
 
     def delete_account(self, nick):
         accs = [a for a in (self.cfg.get("accounts") or []) if a != nick]
@@ -2287,16 +2549,18 @@ class App(tk.Tk if tk else object):
 
         body = tk.Frame(page, bg=BG)
         body.pack(fill="both", expand=True, padx=34, pady=(26, 20))
-        lbl(body, "Настройки", 26, True).pack(anchor="w", pady=(0, 16))
+        lbl(body, "Настройки", 26, True, FG, bg=BG).pack(anchor="w", pady=(0, 16))
         cols = tk.Frame(body, bg=BG)
         cols.pack(fill="both", expand=True)
         cols.grid_columnconfigure(0, weight=1, uniform="c")
         cols.grid_columnconfigure(1, weight=1, uniform="c")
         cols.grid_rowconfigure(0, weight=1)
 
-        left = Card(cols, "Производительность")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        lb = left.body
+        left_wrap = tk.Frame(cols, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        lb = tk.Frame(left_wrap, bg=PANEL, padx=24, pady=20)
+        lb.pack(fill="both", expand=True)
+        lbl(lb, "ПРОИЗВОДИТЕЛЬНОСТЬ", 9, True, ACCENT, bg=PANEL).pack(anchor="w", pady=(0, 12))
         head = tk.Frame(lb, bg=PANEL)
         head.pack(fill="x")
         lbl(head, "Память (Xmx)", 11, False, FG).pack(side="left")
@@ -2317,18 +2581,23 @@ class App(tk.Tk if tk else object):
         mh = tk.Frame(lb, bg=PANEL)
         mh.pack(fill="x")
         lbl(mh, "УСТАНОВЛЕННЫЕ МОДЫ", 9, True, MUTED).pack(side="left")
-        RoundButton(br, "Удалить моды", self.remove_mods, width=140, height=34, size=10,
-                    radius=9).pack(side="left", padx=(10, 0))
+        RoundButton(mh, "Удалить моды", self.remove_mods, width=150, height=34, size=10,
+                    radius=9).pack(side="right")
         reg = load_mod_registry(MC_DIR)
         lbl(mh, ("для Minecraft %s" % reg["mc"]) if reg.get("mc") else "нет", 9, True,
             ACCENT if reg.get("mc") else DIM).pack(side="right")
         self.mods_box = tk.Frame(lb, bg=PANEL)
         self.mods_box.pack(fill="x", pady=(8, 0))
         self.render_mods()
+        self.install_mods_btn = RoundButton(lb, "Установить недостающие моды", self.install_missing_mods,
+                                             height=40, primary=True, size=11, radius=10)
+        self.install_mods_btn.pack(fill="x", pady=(12, 0))
 
-        right = Card(cols, "Игра")
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        rb = right.body
+        right_wrap = tk.Frame(cols, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        right_wrap.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        rb = tk.Frame(right_wrap, bg=PANEL, padx=24, pady=20)
+        rb.pack(fill="both", expand=True)
+        lbl(rb, "ИГРА", 9, True, ACCENT, bg=PANEL).pack(anchor="w", pady=(0, 12))
         lbl(rb, "Путь к Java (пусто = авто)", 10, False, MUTED).pack(anchor="w", pady=(0, 6))
         jr = tk.Frame(rb, bg=PANEL)
         jr.pack(fill="x")
@@ -2355,30 +2624,78 @@ class App(tk.Tk if tk else object):
     # ---- страница «Информация»
     def page_info(self):
         page = tk.Frame(self.content, bg=BG)
-        page.pack(fill="both", expand=True)
-        card = Card(page, padx=60, pady=48, stretch=True, radius=18)
-        card.place(relx=0.5, rely=0.5, anchor="center", width=640, height=380)
-        b = card.body
-        logo = tk.Frame(b, bg=PANEL)
-        logo.pack(pady=(6, 0))
-        lbl(logo, "LIT", 26, True, ACCENT).pack(side="left")
-        lbl(logo, " LAUNCHER", 13, True, FG).pack(side="left", pady=(9, 0))
-        tk.Frame(b, bg=LINE, height=1).pack(fill="x", pady=(26, 30))
-        lbl(b, "Спасибо что пользуетесь\nнашим лаунчером", 22, True, FG, justify="center").pack()
-        sign = tk.Frame(b, bg=PANEL)
-        sign.pack(pady=(30, 0))
-        lbl(sign, "С уважением ", 14, False, MUTED).pack(side="left")
-        lbl(sign, "Nebobs", 14, True, ACCENT).pack(side="left")
-        lbl(sign, " ♥", 16, True, RED).pack(side="left")
-        lbl(b, "Версия %s" % APP_VERSION, 9, False, DIM).pack(side="bottom")
+        page.pack(fill="both", expand=True, padx=34, pady=26)
+        lbl(page, "Информация", 26, True, FG, bg=BG).pack(anchor="w", pady=(0, 16))
+
+        card = tk.Frame(page, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        card.pack(fill="both", expand=True)
+
+        # Градиентный баннер
+        banner = tk.Canvas(card, height=170, bg=PANEL, highlightthickness=0, bd=0)
+        banner.pack(fill="x")
+
+        def _paint_banner(_e=None):
+            w = max(banner.winfo_width(), 200)
+            h = 170
+            banner.delete("all")
+            c1, c2 = "#0e0920", "#b6f26c"
+            for y in range(0, h, 2):
+                banner.create_rectangle(0, y, w, y + 2, fill=_mix(c1, c2, y / float(h)), outline="")
+            for cx, cy, r, col in ((int(w * 0.15), 130, 90, "#1a0b33"),
+                                    (int(w * 0.55), 40, 140, "#29125c"),
+                                    (int(w * 0.9), 150, 120, "#1f6a3c")):
+                banner.create_oval(cx - r, cy - r, cx + r, cy + r, fill=col, outline=col)
+            banner.create_text(w // 2, 62, text="LIT LAUNCHER", fill="#ffffff",
+                               font=(FONT, 30, "bold"))
+            banner.create_text(w // 2, 106, text="Спасибо, что играешь с нами ♥", fill="#e6f7d0",
+                               font=(FONT, 13, "bold"))
+            banner.create_text(w // 2, 140, text="v%s  ·  Made by Nebobs" % APP_VERSION,
+                               fill="#a6e96b", font=(FONT, 10, "bold"))
+        banner.bind("<Configure>", lambda e: _paint_banner())
+        self.after(50, _paint_banner)
+
+        body = tk.Frame(card, bg=PANEL, padx=32, pady=26)
+        body.pack(fill="both", expand=True)
+
+        lbl(body, "Наш собственный SMP уже ждёт!", 18, True, FG, bg=PANEL).pack(anchor="w")
+        lbl(body, "Заходи в наш Discord — там свой SMP, общение, ивенты и обновления лаунчера.",
+            11, False, MUTED, bg=PANEL).pack(anchor="w", pady=(6, 18))
+
+        def _open_discord():
+            webbrowser.open("https://discord.gg/254UJYsFgN")
+        dbtn = RoundButton(body, "Вступить в Discord →", _open_discord,
+                           width=300, height=52, primary=True, size=13, radius=12)
+        dbtn.pack(anchor="w")
+
+        # Мини-статистика
+        tk.Frame(body, bg=LINE, height=1).pack(fill="x", pady=(24, 18))
+        stats = tk.Frame(body, bg=PANEL)
+        stats.pack(fill="x")
+        items = [
+            ("Версия", APP_VERSION),
+            ("Платформа", SYSTEM),
+            ("ОЗУ ПК", "%.1f ГБ" % (self.total_ram / 1024.0)),
+            ("Тема", "тёмная" if CURRENT_THEME == "dark" else "светлая"),
+        ]
+        for i, (k, v) in enumerate(items):
+            box = tk.Frame(stats, bg=PANEL2, padx=16, pady=14)
+            box.pack(side="left", expand=True, fill="x", padx=(0 if i == 0 else 10, 0))
+            lbl(box, k.upper(), 8, True, MUTED, bg=PANEL2).pack(anchor="w")
+            lbl(box, v, 14, True, ACCENT, bg=PANEL2).pack(anchor="w", pady=(4, 0))
+
+        lbl(body, "С уважением, команда LitLauncher", 10, False, DIM,
+            bg=PANEL).pack(anchor="w", pady=(24, 0))
 
     # ---- страница «О лаунчере»
     def page_about(self):
         page = tk.Frame(self.content, bg=BG)
         page.pack(fill="both", expand=True, padx=34, pady=26)
-        lbl(page, "О лаунчере", 26, True).pack(anchor="w", pady=(0, 16))
-        card = Card(page, "%s %s" % (APP_NAME, APP_VERSION))
+        lbl(page, "О лаунчере", 26, True, FG).pack(anchor="w", pady=(0, 16))
+        card = tk.Frame(page, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
         card.pack(fill="x")
+        inner = tk.Frame(card, bg=PANEL, padx=24, pady=20)
+        inner.pack(fill="both", expand=True)
+        lbl(inner, ("%s %s" % (APP_NAME, APP_VERSION)).upper(), 10, True, ACCENT, bg=PANEL).pack(anchor="w", pady=(0, 12))
         items = [
             ("G1GC-флаги", "Фиксированная куча (Xms = Xmx) и pre-touch: меньше фризов от сборщика мусора."),
             ("Fabric и моды", "Fabric API, Sodium, Lithium, FerriteCore, ModernFix, EntityCulling, ImmediatelyFast. При смене версии старые моды удаляются и ставятся под новую."),
@@ -2388,16 +2705,16 @@ class App(tk.Tk if tk else object):
             ("Вход", "Офлайн-режим по нику. Серверы с проверкой лицензии не пустят."),
         ]
         for k, v in items:
-            r = tk.Frame(card.body, bg=PANEL)
+            r = tk.Frame(inner, bg=PANEL)
             r.pack(fill="x", pady=6)
-            lbl(r, k, 11, True, FG, width=15, anchor="w").pack(side="left", anchor="n")
-            lbl(r, v, 11, False, MUTED, justify="left", wraplength=640, anchor="w").pack(side="left")
+            lbl(r, k, 11, True, FG, width=16, anchor="w", bg=PANEL).pack(side="left", anchor="n")
+            lbl(r, v, 11, False, MUTED, justify="left", wraplength=640, anchor="w", bg=PANEL).pack(side="left")
         row = tk.Frame(page, bg=BG)
         row.pack(anchor="w", pady=18)
         RoundButton(row, "Проверить обновления", lambda: self.check_updates(False), width=210, primary=True).pack(side="left")
         RoundButton(row, "Папка данных", lambda: open_folder(BASE), width=160).pack(side="left", padx=10)
         RoundButton(row, "Папка логов", lambda: open_folder(LOG_DIR), width=150).pack(side="left")
-        lbl(page, "Данные: %s" % BASE, 9, False, MUTED).pack(anchor="w")
+        lbl(page, "Данные: %s" % BASE, 9, False, MUTED, bg=BG).pack(anchor="w")
 
     # ---- обновление лаунчера
     def check_updates(self, silent=False):
@@ -2499,8 +2816,32 @@ class App(tk.Tk if tk else object):
 
     def remove_mods(self):
         n = clean_managed_mods(MC_DIR, None)
+        self.cfg["mods_user_removed"] = True
+        save_config(self.cfg)
         self.render_mods()
-        messagebox.showinfo("Моды", "Удалено модов лаунчера: %d" % n)
+        messagebox.showinfo("Моды", "Удалено модов лаунчера: %d\nАвтоустановка отключена. "
+                                     "Вернуть моды — кнопка «Установить недостающие»." % n)
+
+    def install_missing_mods(self):
+        if not self.v_fabric.get():
+            messagebox.showinfo("Моды", "Сначала включите «Fabric + моды оптимизации».")
+            return
+        ver = (self.v_version.get() or self.cfg.get("version") or "").strip()
+        if not ver:
+            messagebox.showinfo("Моды", "Выберите версию Minecraft на вкладке «Играть».")
+            return
+
+        def work():
+            try:
+                install_mods(MC_DIR, ver, lambda m: self.q.put(("log", m)), only_missing=True)
+                self.q.put(("mods_done", True))
+            except Exception as e:  # noqa
+                self.q.put(("mods_done", False))
+                self.q.put(("log", "Ошибка установки модов: %s" % describe_error(e)))
+        self.cfg["mods_user_removed"] = False
+        save_config(self.cfg)
+        self.set_status("Проверяю и докачиваю недостающие моды…")
+        threading.Thread(target=work, daemon=True).start()
 
     def _toggle_theme(self):
         name = "dark" if self.v_dark.get() else "light"
@@ -2522,6 +2863,8 @@ class App(tk.Tk if tk else object):
 
     def play(self):
         if self.busy:
+            # Идёт запуск — кнопка сейчас работает как «Отменить»
+            self.cancel_launch()
             return
         if not _valid_nick(self.v_nick.get().strip()):
             messagebox.showwarning("Ник", "Ник: 3–16 символов, латиница, цифры и _")
@@ -2531,10 +2874,26 @@ class App(tk.Tk if tk else object):
             return
         self.collect_cfg()
         save_config(self.cfg)
+        CANCEL_EVENT.clear()
+        self._game_proc = None
         self.busy = True
         self.set_status("Подготовка…", MUTED)
-        self.play_btn.set("ИДЁТ ЗАПУСК…", False)
+        self.play_btn.set("ОТМЕНИТЬ", True, primary=False)
         threading.Thread(target=self._worker, args=(dict(self.cfg),), daemon=True).start()
+
+    def cancel_launch(self):
+        if not self.busy:
+            return
+        CANCEL_EVENT.set()
+        self.set_status("Отмена запуска…", RED)
+        proc = getattr(self, "_game_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        if self._alive("play_btn"):
+            self.play_btn.set("ОТМЕНА…", False, primary=False)
 
     def _worker(self, cfg):
         log = lambda s: self.q.put(("log", s))
@@ -2542,19 +2901,33 @@ class App(tk.Tk if tk else object):
         err = None
         try:
             cmd, env, mcdir = prepare_launch(cfg, log, prog)
+            check_cancel()
             log("Запуск Minecraft…")
             proc, logpath = launch_process(cmd, env, mcdir, cfg.get("optimize_jvm", True))
+            self._game_proc = proc
+            if CANCEL_EVENT.is_set():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise LaunchCancelled()
             self.q.put(("playing", None))
             started = time.time()
             tail_log(logpath, proc, log)
             rc = proc.wait()
             log("Игра завершилась (код %s)" % rc)
+            if CANCEL_EVENT.is_set():
+                raise LaunchCancelled()
             if rc != 0 and time.time() - started < 40:
                 err = "Игра закрылась с ошибкой (код %s). Подробности в логе." % rc
+        except LaunchCancelled:
+            log("Запуск отменён пользователем")
+            self.q.put(("cancelled", None))
         except Exception as e:  # noqa
             log("ОШИБКА: %s" % e)
             err = "Ошибка: %s" % e
         finally:
+            self._game_proc = None
             self.q.put(("idle", None))
             if err:
                 self.q.put(("error", err))
@@ -2625,13 +2998,36 @@ class App(tk.Tk if tk else object):
             if self._alive("bar"):
                 self.bar.set(0)
             self.set_status("Игра запущена", GREEN)
+            # Ск  ываем окно лаунчера, пока игра работает
+            try:
+                self.withdraw()
+            except Exception:
+                pass
+        elif kind == "cancelled":
+            self.set_status("Запуск отменён", MUTED)
+            if self._alive("log_toggle"):
+                self.toggle_log(True)
         elif kind == "idle":
             self.busy = False
             if self._alive("play_btn"):
-                self.play_btn.set("ИГРАТЬ", True)
+                self.play_btn.set("▶  ИГРАТЬ", True, primary=True)
             if self._alive("bar"):
                 self.bar.set(0)
             self.set_status("Готов к запуску", MUTED)
+            # Возвращаем окно лаунчера после выхода из игры
+            try:
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+            except Exception:
+                pass
+        elif kind == "mods_done":
+            if self._alive("mods_box"):
+                self.render_mods()
+            if p:
+                self.set_status("Моды проверены — недостающие установлены", GREEN)
+            else:
+                self.set_status("Не удалось установить часть модов, смотри лог", RED)
         elif kind == "error":
             self.set_status(p, RED)
             self.toggle_log(True)
